@@ -362,6 +362,16 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         qsa_set_kv_tq(0);
         qsa_set_kv_int8(true);
     }
+    // STRATA_MTP_KV_FP16=1 (opt-in, after Strata-HotRod 890990bb): the draft layer keeps FP16 K/V beside an INT8 main
+    // K/V.  Its output is only ever a proposal the main model checks, so this cannot change a reply - only how often
+    // a draft is accepted - at the price of a draft K/V twice the size.
+    {
+        static const bool draft_fp16 = [] { const char* e = std::getenv("STRATA_MTP_KV_FP16"); return e != nullptr && e[0] == '1'; }();
+        if (draft_fp16 && kv_int8_was && !kv_hybrid_was && kv_tq_was <= 0) {
+            qsa_set_kv_int8(false);
+            std::fprintf(stderr, "strata mtp: the draft layer's K/V is FP16 (STRATA_MTP_KV_FP16=1)\n");
+        }
+    }
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
