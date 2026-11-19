@@ -1769,6 +1769,50 @@ static bool launch_fused_v100(const GrMulti& m, cudaStream_t st) {
     return true;
 }
 
+// v100opt: the single-token read (fused_gr_read) through the same fused kernel on sm_70, so a token's result does
+// not depend on which entry point read it (gr_parity's contract).  fused_gr_read has no scratch argument: a slot of
+// a module-scope array, keyed by the call site's `lo` workspace (two reads sharing one `lo` already race).
+constexpr int VS_FLOATS = V_NS * V_PR + V_NG * V_NS + LR;   // T = 1: partials, slice sums of squares, lo
+__device__ float g_vf_single[V_SLOTS][VS_FLOATS];
+static bool launch_single_v100(const FusedGrArgs& a, cudaStream_t st) {
+    if (!hc_v100_on() || !hc_v100_fused_on() || a.s_down != nullptr || a.q8_down != nullptr || a.q8_mixed != nullptr) return false;
+    static std::mutex mu;
+    static std::vector<const void*> keys[64];
+    static float* base[64] = {};
+    static int sm70[64] = {};   // 0 = not checked, 1 = sm_70, -1 = another card
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return false;
+    float* scratch = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (sm70[dev] == 0) {
+            int cc_maj = 0, cc_min = 0;
+            cudaDeviceGetAttribute(&cc_maj, cudaDevAttrComputeCapabilityMajor, dev);
+            cudaDeviceGetAttribute(&cc_min, cudaDevAttrComputeCapabilityMinor, dev);
+            sm70[dev] = strata::cc_major_of(cc_maj) * 10 + strata::cc_minor_of(cc_min) == 70 ? 1 : -1;
+            void* p = nullptr;
+            if (sm70[dev] > 0 && cudaGetSymbolAddress(&p, g_vf_single) == cudaSuccess) base[dev] = (float*) p;
+            else sm70[dev] = -1;
+            cudaGetLastError();
+        }
+        if (sm70[dev] < 0) return false;
+        auto& ks = keys[dev];
+        size_t i = 0;
+        while (i < ks.size() && ks[i] != (const void*) a.lo) ++i;
+        if (i == ks.size()) {
+            if (ks.size() >= (size_t) V_SLOTS) return false;
+            ks.push_back((const void*) a.lo);
+        }
+        scratch = base[dev] + i * VS_FLOATS;
+    }
+    GrMulti m;
+    m.a[0] = a;
+    m.xn = scratch;
+    m.T = 1;
+    return launch_fused_v100(m, st);
+}
+
 void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
     const int n_tok = m.T;
     const bool q8w = m.a[0].s_down != nullptr;   // STRATA_HC_REQ8: w_down / w_up hold int8 codes
@@ -2951,6 +2995,11 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
         std::exit(1);
     }
     cudaStream_t st = (cudaStream_t) stream;
+    if (launch_single_v100(a, st)) {
+        const cudaError_t e1 = cudaGetLastError();
+        if (e1 != cudaSuccess) { std::fprintf(stderr, "fused_gr_read v100: %s\n", cudaGetErrorString(e1)); std::exit(1); }
+        return;
+    }
     if (a.s_down != nullptr) {   // STRATA_HC_REQ8
         gr_down_kernel<true><<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(a);
         gr_up_kernel<true><<<UP_BLOCKS, THREADS, 0, st>>>(a);
