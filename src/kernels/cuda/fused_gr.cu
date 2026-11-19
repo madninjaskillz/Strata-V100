@@ -1704,6 +1704,7 @@ __global__ void __launch_bounds__(THREADS, 2) gr_fused_v100_kernel(GrMulti m, un
         for (int cc = 0; cc < HC; ++cc) sx += gsum[k][cc][col];
         m.a[k].mixed[d0 + col] = sx / (float) HC;
     }
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // STRATA_QFUSE, as gr_up_fast_kernel
     // 7. the last block out resets the done count for the next read
     if (t == 0) {
         const unsigned v = atomicAdd(&cnt[V_NG + 1], 1u);
@@ -1801,7 +1802,7 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
 #endif
         if (is_sm70) {
             if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
-            if (hc_v100_on() && hc_v100_fused_on() && m.a[0].q8_mixed == nullptr && launch_fused_v100(m, st)) {
+            if (hc_v100_on() && hc_v100_fused_on() && launch_fused_v100(m, st)) {
                 if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);   // v100opt: down + up in one launch
                 return;
             }
