@@ -1491,16 +1491,19 @@ __global__ void __launch_bounds__(THREADS, 2) gr_fused_v100_kernel(GrMulti m, un
     // the epilogue inputs of this thread's token (lane group uj < T)
     float rv[2] = {0.0f, 0.0f}, wn[2] = {0.0f, 0.0f}, bo[2] = {0.0f, 0.0f}, ip[2] = {0.0f, 0.0f};
     const bool apply = uj < T && m.a[uj < T ? uj : 0].apply;
-    if (uj < T) {
-        const FusedGrArgs& a = m.a[uj];
-#pragma unroll
-        for (int p = 0; p < 2; ++p) {
-            const int r = ugrp + 32 * p, cc = r / UPM_COLS, dd = r - cc * UPM_COLS, i = cc * N + d0 + dd;
-            rv[p] = a.R[i];
-            wn[p] = a.w_norm[i];
-            if (apply) { bo[p] = a.bo_prev[d0 + dd]; ip[p] = a.inj_prev[cc]; }
-        }
+    // (T >= 4: they are loaded after the wait instead - 8 more live registers would spill there)
+    constexpr bool EARLY_EPI = T <= 3;
+#define VF_EPI_LOAD()                                                                                             \
+    if (uj < T) {                                                                                                 \
+        const FusedGrArgs& a = m.a[uj];                                                                           \
+        for (int p = 0; p < 2; ++p) {                                                                             \
+            const int r = ugrp + 32 * p, cc = r / UPM_COLS, dd = r - cc * UPM_COLS, i = cc * N + d0 + dd;         \
+            rv[p] = a.R[i];                                                                                       \
+            wn[p] = a.w_norm[i];                                                                                  \
+            if (apply) { bo[p] = a.bo_prev[d0 + dd]; ip[p] = a.inj_prev[cc]; }                                    \
+        }                                                                                                         \
     }
+    if constexpr (EARLY_EPI) { VF_EPI_LOAD() }
     // 2. R' * w_norm of the slice for every token, and the slice's sums of squares
     float ssp[T];
 #pragma unroll
@@ -1662,6 +1665,8 @@ __global__ void __launch_bounds__(THREADS, 2) gr_fused_v100_kernel(GrMulti m, un
         rsS[k][cc] = rsqrtf(ss / (float) N + m.a[k].eps);
     }
     for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = __ldcg(lo_g + i);
+    if constexpr (!EARLY_EPI) { VF_EPI_LOAD() }
+#undef VF_EPI_LOAD
     __syncthreads();
     // 6. the up part: gr_up_fast_kernel's sums (per row and token the same adds in the same order); the token loop
     // is outside the row loop so each lo chunk is read from shared memory once for both rows
