@@ -1485,23 +1485,21 @@ __global__ void __launch_bounds__(THREADS, 2) gr_fused_v100_kernel(GrMulti m, un
     const int row0 = g * V_RPB + warp * V_RPW;
     float* part = m.xn;                                     // [V_NS][T][V_PR]
     float* ssg = m.xn + (size_t) V_NS * T * V_PR;           // [V_NG][V_NS][T]
-    // 1. both matrices' loads
-    uint4 w[V_RPW][V_QL];
-#pragma unroll
-    for (int r = 0; r < V_RPW; ++r) {
-        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_down + (size_t) (row0 + r) * D + (size_t) s * V_SL);
-#pragma unroll
-        for (int q = 0; q < V_QL; ++q) w[r][q] = __ldg(w4 + lane + 32 * q);
-    }
+    // 0. small loads first (they would otherwise queue behind the 13 MB of weight requests): the epilogue
+    // inputs of this block's own columns (only this block writes them, in its up part) ...
     const int uj = t & 7, ugrp = t >> 3, d0 = b * UPM_COLS;
-    uint4 wu[2][5];
+    // the epilogue inputs of this thread's token (lane group uj < T)
+    float rv[2] = {0.0f, 0.0f}, wn[2] = {0.0f, 0.0f}, bo[2] = {0.0f, 0.0f}, ip[2] = {0.0f, 0.0f};
+    const bool apply = uj < T && m.a[uj < T ? uj : 0].apply;
+    if (uj < T) {
+        const FusedGrArgs& a = m.a[uj];
 #pragma unroll
-    for (int p = 0; p < 2; ++p) {
-        const int r = ugrp + 32 * p, cc = r / UPM_COLS, dd = r - cc * UPM_COLS, i = cc * N + d0 + dd;
-        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
-#pragma unroll
-        for (int q = 0; q < 4; ++q) wu[p][q] = __ldg(w4 + uj + 8 * q);
-        wu[p][4] = __ldg(w4 + 32 + uj);
+        for (int p = 0; p < 2; ++p) {
+            const int r = ugrp + 32 * p, cc = r / UPM_COLS, dd = r - cc * UPM_COLS, i = cc * N + d0 + dd;
+            rv[p] = a.R[i];
+            wn[p] = a.w_norm[i];
+            if (apply) { bo[p] = a.bo_prev[d0 + dd]; ip[p] = a.inj_prev[cc]; }
+        }
     }
     // 2. R' * w_norm of the slice for every token, and the slice's sums of squares
     float ssp[T];
@@ -1527,6 +1525,23 @@ __global__ void __launch_bounds__(THREADS, 2) gr_fused_v100_kernel(GrMulti m, un
             X4[i] = make_float4(r.x * gg.x, r.y * gg.y, r.z * gg.z, r.w * gg.w);
         }
         ssp[k] = sp;
+    }
+    // 1. ... then both matrices' loads, in flight while the slice sums are reduced
+    uint4 w[V_RPW][V_QL];
+#pragma unroll
+    for (int r = 0; r < V_RPW; ++r) {
+        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_down + (size_t) (row0 + r) * D + (size_t) s * V_SL);
+#pragma unroll
+        for (int q = 0; q < V_QL; ++q) w[r][q] = __ldg(w4 + lane + 32 * q);
+    }
+    uint4 wu[2][5];
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int r = ugrp + 32 * p, cc = r / UPM_COLS, dd = r - cc * UPM_COLS, i = cc * N + d0 + dd;
+        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) wu[p][q] = __ldg(w4 + uj + 8 * q);
+        wu[p][4] = __ldg(w4 + 32 + uj);
     }
 #pragma unroll
     for (int k = 0; k < T; ++k) {
@@ -1647,19 +1662,6 @@ __global__ void __launch_bounds__(THREADS, 2) gr_fused_v100_kernel(GrMulti m, un
         rsS[k][cc] = rsqrtf(ss / (float) N + m.a[k].eps);
     }
     for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = __ldcg(lo_g + i);
-    // the epilogue inputs of this thread's token (lane group uj < T)
-    float rv[2] = {0.0f, 0.0f}, wn[2] = {0.0f, 0.0f}, bo[2] = {0.0f, 0.0f}, ip[2] = {0.0f, 0.0f};
-    const bool apply = uj < T && m.a[uj < T ? uj : 0].apply;
-    if (uj < T) {
-        const FusedGrArgs& a = m.a[uj];
-#pragma unroll
-        for (int p = 0; p < 2; ++p) {
-            const int r = ugrp + 32 * p, cc = r / UPM_COLS, dd = r - cc * UPM_COLS, i = cc * N + d0 + dd;
-            rv[p] = a.R[i];
-            wn[p] = a.w_norm[i];
-            if (apply) { bo[p] = a.bo_prev[d0 + dd]; ip[p] = a.inj_prev[cc]; }
-        }
-    }
     __syncthreads();
     // 6. the up part: gr_up_fast_kernel's sums (per row and token the same adds in the same order); the token loop
     // is outside the row loop so each lo chunk is read from shared memory once for both rows
