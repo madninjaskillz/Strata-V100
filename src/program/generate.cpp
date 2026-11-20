@@ -13847,7 +13847,7 @@ int main(int argc, char** argv) {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
-            if (n + max_new + 8 > o.max_context) {
+            if (max_new < 0 || max_new > o.max_context - n - 8) {   // (not n + max_new + 8: a huge max_new overflows and passes)
                 std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
                             (long long) max_new, (long long) o.max_context);
                 continue;
@@ -16828,10 +16828,11 @@ int main(int argc, char** argv) {
                             return die("saving the input checkpoint failed");
                         }
                     }
+                    const bool stopping = stop_req.load();   // read once: a STOP between two reads ended the request as "length"
                     if (nf) finish = "nonfinite";
                     else if (eos) finish = "stop";
-                    else if (stop_req.load()) finish = "cancel";
-                    const bool last = nf || eos || produced_n >= max_new || stop_req.load();
+                    else if (stopping) finish = "cancel";
+                    const bool last = nf || eos || produced_n >= max_new || stopping;
                     // Cover both verifier windows and the drafter's lookahead, as the serial loop covers its window.
                     // Do not promote B across a growth boundary: even a correct guess must be drained and rolled back.
                     const int64_t next_cells = std::min<int64_t>(o.max_context,
