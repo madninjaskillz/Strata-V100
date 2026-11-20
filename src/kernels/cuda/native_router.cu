@@ -326,6 +326,153 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
         }
     }
 }
+// the window's routing in ONE launch instead of three - route_multi (softmax + top-10), route_resident_k
+// (the residency swap, when `res_swap` is set) and doorbell_publish_res_kernel (ids and, on a miss, the activation
+// rows to the mapped host buffers, then the ring).  One warp per token as in each of the three; every value written
+// (ids, weights, ids_out, x_out, the ring, the counters) is the one the three launches write, bit for bit: the
+// picked set stays in the warp's registers between the stages instead of going through `ids`.
+// do_topk = 0: the ids / weights are already there (the single-token route wrote them).  At most 8 tokens.
+__launch_bounds__(256, 1)
+__global__ void route_fused_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                              int n_tok, int do_topk, const int32_t* __restrict__ res_swap, float margin, int lo, int hi,
+                              unsigned long long* __restrict__ stats, const float* __restrict__ x,
+                              const int32_t* __restrict__ d_res, int n_expert, int n, float* x_out, int32_t* ids_out,
+                              uint32_t* seq) {
+    const int tk = (int) threadIdx.y, lane = (int) threadIdx.x, tid = tk * 32 + lane;
+    const bool active = tk < n_tok;
+    int32_t my[10];
+#pragma unroll
+    for (int r = 0; r < 10; ++r) my[r] = 0;
+    int any_miss = 0;
+    if (active) {
+        const float* l = logits + (size_t) tk * 512;
+        int32_t* id = ids + (size_t) tk * 10;
+        float* wt = weights + (size_t) tk * 10;
+        if (do_topk) {   // route_multi
+            float values[16];
+#pragma unroll
+            for (int i = 0; i < 16; ++i) values[i] = l[lane + i * 32];
+            __syncwarp();
+            float maximum = -INFINITY;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
+            maximum = warp_max(maximum);
+            float sum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                values[i] = expf(values[i] - maximum);
+                sum += values[i];
+            }
+            const float reciprocal = 1.0f / warp_sum(sum);
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                values[i] *= reciprocal;
+                if (__isnanf(values[i])) values[i] = -FLT_MAX;
+            }
+            float selected = 0.0f, selected_sum = 0.0f;
+            for (int rank = 0; rank < 10; ++rank) {
+                float best = values[0];
+                int expert = lane;
+#pragma unroll
+                for (int i = 1; i < 16; ++i) {
+                    if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
+                }
+#pragma unroll
+                for (int mask = 16; mask; mask >>= 1) {
+                    const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
+                    const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
+                    if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
+                }
+                if ((expert & 31) == lane) {
+                    values[expert / 32] = -INFINITY;
+                    selected_sum += best;
+                }
+                my[rank] = expert;   // the same winner in every lane after the xor tree
+                if (rank == lane) selected = best;
+            }
+            selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
+            const float inverse_selected_sum = 1.0f / selected_sum;
+            if (lane < 10) wt[lane] = selected * inverse_selected_sum;
+        } else {
+#pragma unroll
+            for (int r = 0; r < 10; ++r) my[r] = id[r];
+        }
+        if (res_swap != nullptr) {   // route_resident_k
+            const int32_t* res = res_swap;
+            int swaps = 0, tail = 0, before = 0;
+            if (lane == 0)
+                for (int r = 0; r < 10; ++r) before += res[my[r]] < 0;
+            for (int r = lo; r <= hi && r < 10; ++r) {
+                const int e = my[r];
+                if (res[e] >= 0) continue;
+                if (lane == 0) ++tail;
+                float bv = -INFINITY;
+                int bi = -1;
+                for (int f = lane; f < 512; f += 32) {
+                    if (res[f] < 0) continue;
+                    bool used = false;
+                    for (int q = 0; q < 10; ++q) used |= my[q] == f;
+                    if (used) continue;
+                    if (l[f] > bv) { bv = l[f]; bi = f; }
+                }
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+                    const int oi = __shfl_down_sync(0xffffffffu, bi, off);
+                    if (ov > bv || (ov == bv && oi >= 0 && (bi < 0 || oi < bi))) { bv = ov; bi = oi; }
+                }
+                if (lane == 0 && bi >= 0 && l[e] - bv <= margin) { my[r] = bi; ++swaps; }
+                my[r] = __shfl_sync(0xffffffffu, my[r], 0);
+            }
+            int after = 0;
+            if (lane == 0)
+                for (int r = 0; r < 10; ++r) after += res[my[r]] < 0;
+            const int sw = __shfl_sync(0xffffffffu, swaps, 0);
+            if (sw) {
+                float m = -INFINITY;
+                for (int r = 0; r < 10; ++r) m = fmaxf(m, l[my[r]]);
+                float ex[10], sum = 0.0f;
+                for (int r = 0; r < 10; ++r) { ex[r] = expf(l[my[r]] - m); sum += ex[r]; }
+                if (lane < 10) wt[lane] = ex[lane] / sum;
+            }
+            if (lane == 0 && stats) {
+                atomicAdd(stats + 0, (unsigned long long) tail);
+                atomicAdd(stats + 1, (unsigned long long) sw);
+                atomicAdd(stats + 2, (unsigned long long) before);
+                atomicAdd(stats + 3, (unsigned long long) after);
+            }
+        }
+        // the final ids: `ids` for the device, `ids_out` for the host (doorbell_publish_res_kernel's first part)
+        if (lane < 10) {
+            int32_t v = 0;
+#pragma unroll
+            for (int r = 0; r < 10; ++r) if (r == lane) v = my[r];
+            if (do_topk || res_swap != nullptr) id[lane] = v;
+            ids_out[tk * 10 + lane] = v;
+            if (d_res == nullptr || v < 0 || v >= n_expert || d_res[v] < 0) any_miss = 1;
+        }
+    }
+    if (__syncthreads_or(any_miss)) {
+        for (int i = tid; i < n; i += 256) x_out[i] = x[i];
+        __threadfence_system();
+    } else if (active && lane < 10) {
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (tid == 0) *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+}
+void native_route_fused(const float* logits, int32_t* ids, float* weights, int n_tok, bool do_topk, const int32_t* res_swap,
+                        float margin, int rank_lo, int rank_hi, unsigned long long* stats, const float* x,
+                        const int32_t* d_res, int n_expert, int64_t n, float* x_out, int32_t* ids_out, uint32_t* d_seq,
+                        void* stream) {
+    if (!stream || n_tok < 1 || n_tok > 8 || !logits || !ids || !weights || !x_out || !ids_out || !d_seq)
+        throw std::invalid_argument("native_route_fused: bad arguments");
+    route_fused_k<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
+        logits, ids, weights, n_tok, do_topk ? 1 : 0, res_swap, margin, rank_lo, rank_hi, stats, x, d_res, n_expert, (int) n,
+        x_out, ids_out, d_seq);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
                            int rank_lo, int rank_hi, unsigned long long* stats, void* stream) {
     if (!stream || n_tok < 1 || !res_layer) throw std::invalid_argument("native_route_resident: bad arguments");

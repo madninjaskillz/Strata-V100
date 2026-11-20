@@ -24,4 +24,12 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
 /// `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after.
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
                            int rank_lo, int rank_hi, unsigned long long* stats, void* stream);
+/// (CUDA): native_router_top10_multi (when do_topk), native_route_resident (when res_swap is not null) and
+/// doorbell_publish_res in one launch for a window of at most 8 tokens; every value written is bitwise the three
+/// calls'.  n = the activation floats to publish on a miss (n_tok * n_embd); x_out / ids_out / d_seq are the mapped
+/// host buffers and the ring doorbell_publish_res takes.
+void native_route_fused(const float* logits, int32_t* ids, float* weights, int n_tok, bool do_topk, const int32_t* res_swap,
+                        float margin, int rank_lo, int rank_hi, unsigned long long* stats, const float* x,
+                        const int32_t* d_res, int n_expert, int64_t n, float* x_out, int32_t* ids_out, uint32_t* d_seq,
+                        void* stream);
 }

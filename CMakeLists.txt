@@ -1122,6 +1122,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(fused_gr_bench src/kernels/fused_gr_bench.cpp)
   target_include_directories(fused_gr_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(fused_gr_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_executable(route_fused_parity src/kernels/route_fused_parity.cpp)
+  target_include_directories(route_fused_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(route_fused_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME route_fused_parity COMMAND route_fused_parity)
   # STRATA_ROUTE_RESIDENT's swap, serial vs warp: the bench holds the pre-port serial kernel (so it is compiled as
   # CUDA, the one device-code file among the .cpp benches) and times the two forms on the same input in one run.
   # The chain modes above call the plain top-10 on a fully resident table, so they never reach the swap; this does.

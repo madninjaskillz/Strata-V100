@@ -240,6 +240,7 @@ absent variable as enabled. `engine default` means a value the code computes.
 | `STRATA_ROUTE_RESIDENT` | off (value = margin in logits) | residency-biased routing. Changes the answer |
 | `STRATA_ROUTE_RESIDENT_RANKS` | 6-9 | rank range the residency margin applies to |
 | `STRATA_ROUTE_RESIDENT_MTP` | off | the same bias in the MTP draft layer (experimental, changes answers) |
+| `STRATA_ROUTE_FUSE` | off | `experimental`, CUDA. `1` runs the top-10, the residency swap and the doorbell of a decode window in one launch. Bitwise the three launches. Not used with a route prior, an expert cap, a device plan or a helper-GPU publish |
 | `STRATA_ROUTE_PRIOR` | 0 (off) | logit bonus for the previous token's experts when the top-10 is picked. Changes the output |
 | `STRATA_ROUTE_PER_TOKEN` | on | route each row on its own; the variable forces the per-token table |
 | `STRATA_ROUTE_PROJ_PER_TOKEN` | off | project the router input per token instead of per window |

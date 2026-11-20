@@ -1865,6 +1865,23 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
+        // STRATA_ROUTE_FUSE=1 (CUDA, opt-in; default: the separate launches): the top-10, the residency swap and
+        // the doorbell in one launch (native_route_fused, bitwise the three) when nothing else reads the picks in
+        // between: no route prior, no expert cap, no device plan, the plain doorbell_publish_res.
+        bool rfuse = false, rfuse_topk = false;
+#if !defined(STRATA_USE_HIP)
+        {
+            static const bool rfuse_env = [] {
+                const char* e = std::getenv("STRATA_ROUTE_FUSE");
+                if (e == nullptr || e[0] != '1') return false;
+                const char* rp = std::getenv("STRATA_ROUTE_PRIOR");
+                const char* ec = std::getenv("STRATA_VERIFY_ECAP");
+                return !(rp != nullptr && std::atof(rp) > 0.0) && !(ec != nullptr && std::atoi(ec) > 0);
+            }();
+            rfuse = rfuse_env && NE == 512 && K == 10 && n >= 1 && n <= 8 && !ar_on() && !device_plan_ && !remote_opt_ &&
+                    !always_publish_ && native_router_enabled();
+        }
+#endif
         // S26 STRATA_LFUSE=1: the shared expert's gate row rides in the router GEMV launch, its sigmoid + row scale
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
@@ -1878,6 +1895,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
+                if (rfuse) rfuse_topk = true;   // deferred into native_route_fused below
+                else
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
@@ -1900,7 +1919,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
-        if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+        if (!rfuse && route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
             // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
             try {
                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
@@ -1940,7 +1959,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (remote_opt_ || always_publish_)
                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
-            else {
+            else if (rfuse) {
+                const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
+                const bool swap = route_resident_cfg().margin > 0.0f && layer_res != nullptr;
+                try {
+                    native_route_fused(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, rfuse_topk, swap ? layer_res : nullptr,
+                                       route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
+                                       swap && rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, xm, layer_res,
+                                       (int) g.n_expert, (int64_t) n * N, m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
+                } catch (const std::exception& e) { err = "verify route (fused): " + std::string(e.what()); return false; }
+            } else {
                 const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
                 doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
                                      m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
